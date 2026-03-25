@@ -1163,7 +1163,11 @@ input[type="file"] { display: none; }
         <div class="scanner-sublabel">Point camera at a punch list QR code to create or open an item</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
           <button class="btn btn-scan" id="start-scan-btn" onclick="startScanner()">⬤ START CAMERA</button>
+          <button class="manual-btn" id="torch-btn" onclick="toggleTorch()" style="display:none">🔦 Torch</button>
           <button class="manual-btn" onclick="openManualModal()">+ Manual Entry</button>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);text-align:center;line-height:1.9;letter-spacing:.5px">
+          Hold code steady · Good lighting helps · 15–30cm distance
         </div>
       </div>
 
@@ -1621,6 +1625,9 @@ function renderList() {
 }
 
 // QR Scanner
+let scanLoopTimer = null;
+let torchOn = false;
+
 async function startScanner() {
   const video  = document.getElementById('scanner-video');
   const status = document.getElementById('scanner-status');
@@ -1629,40 +1636,95 @@ async function startScanner() {
   if (scanning) { stopScanner(); return; }
 
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    // Request highest possible resolution for better QR detection
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width:  { ideal: 1920, min: 640 },
+        height: { ideal: 1080, min: 480 }
+      }
+    });
     video.srcObject = stream;
+
+    // Wait for video to actually start playing before scanning
+    await new Promise(resolve => {
+      video.onloadedmetadata = () => { video.play().then(resolve).catch(resolve); };
+    });
+
     scanning = true;
     btn.textContent = '⬛ STOP CAMERA';
     status.textContent = 'SCANNING…';
-    scanFrame();
+
+    // Show torch button if supported
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.torch) {
+      document.getElementById('torch-btn').style.display = 'inline-flex';
+    }
+
+    scanLoop();
   } catch(err) {
     showToast('Camera access denied or unavailable', true);
     status.textContent = 'CAMERA ERROR';
+    console.error(err);
   }
 }
 
 function stopScanner() {
+  if (scanLoopTimer) { clearTimeout(scanLoopTimer); scanLoopTimer = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   scanning = false;
+  torchOn = false;
   const btn = document.getElementById('start-scan-btn');
   if (btn) btn.textContent = '⬤ START CAMERA';
   const status = document.getElementById('scanner-status');
   if (status) status.textContent = 'READY TO SCAN';
+  const tb = document.getElementById('torch-btn');
+  if (tb) { tb.style.display = 'none'; tb.textContent = '🔦 Torch'; }
 }
 
-function scanFrame() {
+function scanLoop() {
   if (!scanning) return;
+
   const video  = document.getElementById('scanner-video');
   const canvas = document.getElementById('scanner-canvas');
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0);
+
+  if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+    // Use native video resolution on canvas for maximum detail
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'dontInvert' });
-    if (code) { handleQRCode(code.data); return; }
+
+    // tryBothInversions handles both dark-on-light and light-on-dark QR codes
+    const code = jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: 'attemptBoth'
+    });
+
+    if (code && code.data) {
+      handleQRCode(code.data);
+      return;
+    }
   }
-  requestAnimationFrame(scanFrame);
+
+  // 150ms throttle — gives camera autofocus time to settle between frames
+  scanLoopTimer = setTimeout(scanLoop, 150);
+}
+
+async function toggleTorch() {
+  if (!stream) return;
+  const track = stream.getVideoTracks()[0];
+  torchOn = !torchOn;
+  try {
+    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    document.getElementById('torch-btn').textContent = torchOn ? '🔦 Torch ON' : '🔦 Torch';
+  } catch(e) {
+    showToast('Torch not supported on this device', true);
+    torchOn = false;
+  }
 }
 
 function handleQRCode(data) {
@@ -1671,7 +1733,7 @@ function handleQRCode(data) {
   showToast('QR Scanned: ' + data);
   let item = getItem(data);
   if (!item) item = createItem(data);
-  setTimeout(() => openItem(item.id), 400);
+  setTimeout(() => openItem(item.id), 300);
 }
 
 function openManualModal() {
